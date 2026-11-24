@@ -5,6 +5,7 @@ using System.IO;
 using System.Media;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -44,6 +45,7 @@ internal sealed class Studio : Form
         new[] {"踩镲","军鼓","底鼓"}
     };
 
+    private readonly TableLayoutPanel layout = new TableLayoutPanel();
     private readonly StrokeGrid grid = new StrokeGrid();
     private readonly Button[] tabs = new Button[3];
     private readonly Label[] headers = new Label[Steps];
@@ -83,7 +85,10 @@ internal sealed class Studio : Form
         ClientSize = new Size(940, 555);
         MinimumSize = new Size(710, 535);
 
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(19, 15, 19, 12) };
+        layout.Dock = DockStyle.Fill;
+        layout.ColumnCount = 1;
+        layout.RowCount = 5;
+        layout.Padding = new Padding(19, 15, 19, 12);
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
@@ -138,6 +143,10 @@ internal sealed class Studio : Form
         transport.Controls.Add(play);
         transport.Controls.Add(bpm);
         transport.Controls.Add(tempo);
+        var import = ActionButton("导入音频", Paper);
+        import.Margin = new Padding(12, 3, 8, 3);
+        import.Click += async (sender, args) => await ImportAudio();
+        transport.Controls.Add(import);
         layout.Controls.Add(transport, 0, 1);
 
         var tracks = FlowRow();
@@ -644,6 +653,7 @@ internal sealed class Studio : Form
         if (hadChanges && !dirty && string.Equals(projectPath, path,
             StringComparison.OrdinalIgnoreCase)) return;
         ApplyProject(project, path);
+        status.Text = "已打开工程 " + Path.GetFileName(path);
     }
 
     private void ApplyProject(Project project, string path)
@@ -657,11 +667,70 @@ internal sealed class Studio : Form
         projectPath = path;
         dirty = false;
         UpdateTitle();
-        status.Text = "已打开工程 " + Path.GetFileName(path);
+    }
+
+    private async Task ImportAudio()
+    {
+        string path;
+        using (var dialog = new OpenFileDialog { Filter = "支持的音频 (*.mp3;*.ogg;*.oga;*.opus)|*.mp3;*.ogg;*.oga;*.opus|OGG 音频 (*.ogg;*.oga;*.opus)|*.ogg;*.oga;*.opus|MP3 音频 (*.mp3)|*.mp3", Title = "导入音频并转成 8bit" })
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            path = dialog.FileName;
+        }
+        await ImportAudioFile(path);
+    }
+
+    private async Task ImportAudioFile(string path)
+    {
+        EndStroke();
+        StopLoop();
+        int importBpm = bpm.Value;
+        bool truncated = false;
+        Project project;
+        status.Text = "正在识别音频主旋律…";
+        UseWaitCursor = true;
+        layout.Enabled = false;
+        try
+        {
+            project = await Task.Run(() => AudioImport.Convert(path, importBpm, out truncated));
+        }
+        catch (InvalidDataException error)
+        {
+            if (!IsDisposed) status.Text = error.Message;
+            return;
+        }
+        catch (Exception error)
+        {
+            if (!(error is COMException || error is IOException || error is UnauthorizedAccessException ||
+                error is DllNotFoundException || error is EntryPointNotFoundException)) throw;
+            if (!IsDisposed) status.Text = "无法解码此音频。请确认文件完整且可以播放。";
+            return;
+        }
+        finally
+        {
+            if (!IsDisposed)
+            {
+                layout.Enabled = true;
+                UseWaitCursor = false;
+            }
+        }
+
+        if (IsDisposed) return;
+        if (!ConfirmSaveChanges())
+        {
+            status.Text = "已取消导入";
+            return;
+        }
+        ApplyProject(project, null);
+        MarkChanged();
+        status.Text = truncated
+            ? "已导入前 " + Studio.MaxBars + " 小节的主旋律"
+            : "已导入主旋律 · " + project.Bars + " 小节";
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        if (!layout.Enabled) return base.ProcessCmdKey(ref msg, keyData);
         if (keyData == (Keys.Control | Keys.O))
         {
             OpenProject();
@@ -932,6 +1001,11 @@ internal static class Synth
         { 72,71,69,67,65,64,62,60 },
         { 48,47,45,43,41,40,38,36 }
     };
+
+    internal static int MelodyPitch(int row)
+    {
+        return Midi[0, row];
+    }
 
     internal static byte[] Render(bool[,,] song, int bpm, int firstStep, int stepCount)
     {
